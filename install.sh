@@ -17,6 +17,7 @@ PATCH_REF="${HERMES_SKILLHUB_PATCH_REF:-main}"
 PATCH_RAW_BASE="${HERMES_SKILLHUB_PATCH_RAW_BASE:-https://raw.githubusercontent.com/${PATCH_REPO}/${PATCH_REF}}"
 CHECK_ONLY=0
 NO_BACKUP=0
+RESTORE=0
 PATCHER_PATH=""
 PATCHER_TMP=""
 
@@ -40,6 +41,7 @@ Options:
   --ref REF            Patch repo ref (default: main)
   --check              Validate patch applicability without modifying Hermes code
   --no-backup          Do not create tools/skills_hub.py.bak
+  --restore            Restore tools/skills_hub.py from backup (.bak)
   -h, --help           Show this help
 EOF
 }
@@ -84,6 +86,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-backup)
             NO_BACKUP=1
+            shift
+            ;;
+        --restore)
+            RESTORE=1
             shift
             ;;
         -h|--help)
@@ -185,11 +191,14 @@ fi
 if [[ "$NO_BACKUP" -eq 1 ]]; then
     patch_args+=(--no-backup)
 fi
+if [[ "$RESTORE" -eq 1 ]]; then
+    patch_args+=(--restore)
+fi
 
 resolve_patcher
 "$py" "$PATCHER_PATH" "${patch_args[@]}"
 
-if [[ "$CHECK_ONLY" -eq 0 ]]; then
+if [[ "$CHECK_ONLY" -eq 0 && "$RESTORE" -eq 0 ]]; then
     HERMES_ENV_FILE="${HERMES_HOME}/.env"
     upsert_env_value "$HERMES_ENV_FILE" "SKILLHUB_URL" "$SKILLHUB_URL_VALUE"
     upsert_env_value "$HERMES_ENV_FILE" "SKILLHUB_TOKEN" "$SKILLHUB_TOKEN_VALUE"

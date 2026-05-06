@@ -98,6 +98,45 @@ def _garena_skillhub_find_skill(slug: str) -> Optional[Dict[str, Any]]:
         if isinstance(item, dict) and item.get("slug") == slug:
             return item
     return None
+
+
+def _garena_skillhub_event_download_zip(slug: str, skill_id: Any) -> Dict[str, str]:
+    import io
+    import zipfile
+
+    files: Dict[str, str] = {}
+    try:
+        resp = httpx.get(
+            f"{_garena_skillhub_event_base_url()}/download",
+            params={"id": skill_id},
+            headers=_garena_skillhub_auth_headers(),
+            timeout=30,
+            follow_redirects=True,
+        )
+        if resp.status_code != 200:
+            logger.debug("Garena SkillHub event API ZIP download for %s returned %s", slug, resp.status_code)
+            return files
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                try:
+                    name = _validate_bundle_rel_path(info.filename)
+                except ValueError:
+                    logger.debug("Skipping unsafe ZIP member path: %s", info.filename)
+                    continue
+                if info.file_size > 500_000:
+                    logger.debug("Skipping large file in ZIP: %s (%d bytes)", name, info.file_size)
+                    continue
+                try:
+                    files[name] = zf.read(info.filename).decode("utf-8")
+                except (UnicodeDecodeError, KeyError):
+                    logger.debug("Skipping non-text file in ZIP: %s", name)
+    except zipfile.BadZipFile:
+        logger.warning("Garena SkillHub returned invalid ZIP (event API) for %s", slug)
+    except httpx.HTTPError as exc:
+        logger.debug("Garena SkillHub event API ZIP download failed for %s: %s", slug, exc)
+    return files
 # END Garena SkillHub patch
 '''
 
@@ -138,6 +177,14 @@ FETCH_METHOD = '''    def fetch(self, identifier: str) -> Optional[SkillBundle]:
             return None
 
         files = self._download_zip(slug, latest_version)
+
+        # Fallback: event API download via /api/event/skill/download when v1 download fails
+        if "SKILL.md" not in files:
+            item = _garena_skillhub_find_skill(slug)
+            if item is not None:
+                skill_id = item.get("id")
+                if skill_id is not None:
+                    files = _garena_skillhub_event_download_zip(slug, skill_id)
 
         if "SKILL.md" not in files:
             version_data = self._get_json(f"{self.BASE_URL}/skills/{slug}/versions/{latest_version}")
@@ -254,11 +301,11 @@ CREATE_ROUTER = '''def create_source_router(auth: Optional[GitHubAuth] = None) -
     """
     Create company-approved source adapters for search/fetch operations.
 
-    External public skill hubs and direct URL/GitHub installs are intentionally
-    disabled. The "clawhub" source id is backed by Garena SkillHub.
+    Official optional skills, external public skill hubs, and direct URL/GitHub
+    installs are intentionally disabled. The "clawhub" source id is backed by
+    Garena SkillHub.
     """
     sources: List[SkillSource] = [
-        OptionalSkillSource(),
         ClawHubSource(),
     ]
 
@@ -347,15 +394,43 @@ def main() -> int:
     parser.add_argument("--hermes-root", required=True, help="Hermes checkout/install root containing tools/skills_hub.py")
     parser.add_argument("--check", action="store_true", help="Validate patch applicability without writing")
     parser.add_argument("--no-backup", action="store_true", help="Do not create tools/skills_hub.py.bak")
+    parser.add_argument("--restore", action="store_true", help="Restore tools/skills_hub.py from backup (.bak)")
     args = parser.parse_args()
 
     root = Path(args.hermes_root).expanduser().resolve()
     target = root / "tools" / "skills_hub.py"
+
+    if args.restore:
+        backup = target.with_suffix(target.suffix + ".bak")
+        if not backup.exists():
+            print(f"No backup found at {backup}", file=sys.stderr)
+            return 1
+        shutil.copy2(backup, target)
+        print(f"Restored {target} from {backup}")
+        return 0
+
     if not target.exists():
         print(f"tools/skills_hub.py not found under {root}", file=sys.stderr)
         return 2
 
     original = target.read_text(encoding="utf-8")
+
+    if HELPER_MARKER in original:
+        if args.check:
+            print(f"{target} is already patched")
+            return 0
+        backup = target.with_suffix(target.suffix + ".bak")
+        if not backup.exists():
+            print(
+                f"{target} is already patched and no backup (.bak) exists.\n"
+                f"Restore the original manually, then re-run the installer.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"{target} is already patched; restoring from backup and re-applying...")
+        shutil.copy2(backup, target)
+        original = target.read_text(encoding="utf-8")
+
     try:
         patched = patch_text(original)
     except RuntimeError as exc:

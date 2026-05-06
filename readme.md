@@ -1,26 +1,89 @@
 # hermes-skillhub-patch
 
-This directory implements the Garena SkillHub integration by patching Hermes
-source code instead of relying on `sitecustomize.py`.
+`hermes-skillhub-patch` is a source patch for
+[Hermes Agent](https://github.com/NousResearch/hermes-agent). It changes how
+Hermes discovers and installs skills.
 
-## Goal
+The patch is intended for managed environments that need to control where
+Hermes can fetch skills from. After installation, Hermes routes the `clawhub`
+source id to a company SkillHub endpoint and removes other skill acquisition
+routes from the active router.
 
-- disable other public skill hub adapters in Hermes search/install routing
-- keep the existing `clawhub` source id, but send it to `skillhub.ingarena.net`
-- keep `SKILLHUB_URL` and `SKILLHUB_TOKEN` in the normal Hermes `.env`
+## Purpose
+
+Hermes supports multiple skill sources by default, including public registries,
+GitHub, direct URLs, and marketplace indexes. That is convenient for general
+use, but it is not suitable when skill installation must be limited to an
+approved registry.
+
+This patch modifies `tools/skills_hub.py` so Hermes uses a restricted source
+router:
+
+```text
+clawhub
+```
+
+The `clawhub` source id is kept for CLI and lock-file compatibility, but the
+implementation is redirected to a SkillHub service that supports a
+ClawHub-compatible protocol.
+
+## What Changes
+
+The patch updates Hermes behavior in three areas:
+
+- restricts `create_source_router()` to `clawhub`
+- disables `official`, `url`, `github`, `hermes-index`, `skills-sh`,
+  `well-known`, `claude-marketplace`, and `lobehub` as active skill acquisition
+  routes
+- changes `ClawHubSource` to use `SKILLHUB_URL` and `SKILLHUB_TOKEN` from the
+  Hermes `.env`
+
+Default SkillHub URL:
+
+```text
+https://skillhub.ingarena.net
+```
+
+Generated API base:
+
+```text
+https://skillhub.ingarena.net/api/v1
+```
+
+## Supported Protocol
+
+The patched `clawhub` adapter expects a ClawHub-compatible SkillHub protocol:
+
+| Operation | Endpoint |
+|---|---|
+| Search / inspect | `GET /api/event/skill/list` |
+| Skill metadata | `GET /api/v1/skills/{slug}` |
+| Skill download | `GET /api/v1/download` |
+
+`SKILLHUB_TOKEN` is sent as:
+
+```text
+Authorization: Bearer <token>
+```
 
 ## Install
-
-Primary one-line install from GitHub:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/arxeme/hermes-skillhub-patch/main/install.sh | bash -s -- --hermes-root /path/to/hermes-agent --token 'skh_...'
-```
 
 Dry-run first:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/arxeme/hermes-skillhub-patch/main/install.sh | bash -s -- --hermes-root /path/to/hermes-agent --check
+```
+
+Apply the patch:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/arxeme/hermes-skillhub-patch/main/install.sh | bash -s -- --hermes-root /path/to/hermes-agent --token 'skh_...'
+```
+
+Use a custom SkillHub URL:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/arxeme/hermes-skillhub-patch/main/install.sh | bash -s -- --hermes-root /path/to/hermes-agent --skillhub-url https://skillhub.example.com --token 'skh_...'
 ```
 
 Local clone install:
@@ -29,45 +92,32 @@ Local clone install:
 ./install.sh --hermes-root /path/to/hermes-agent --token 'skh_...'
 ```
 
+## Installer Behavior
+
 The installer:
 
 - patches `/path/to/hermes-agent/tools/skills_hub.py`
 - creates `/path/to/hermes-agent/tools/skills_hub.py.bak` unless `--no-backup`
-- writes `SKILLHUB_URL=https://skillhub.ingarena.net` to `~/.hermes/.env`
-- writes `SKILLHUB_TOKEN=...` to `~/.hermes/.env` when `--token` is supplied
+- writes `SKILLHUB_URL` to `~/.hermes/.env`
+- writes `SKILLHUB_TOKEN` to `~/.hermes/.env` when `--token` is supplied
 
 When `install.sh` is executed through `curl | bash`, it downloads
 `scripts/apply_patch.py` from the same GitHub repo/ref before applying the
-source patch. Use `--repo OWNER/REPO` or `--ref REF` to install from a fork or
-branch.
+source patch.
 
-Hermes already loads `~/.hermes/.env` during CLI startup, before
-`tools.skills_hub` is imported by `hermes_cli.skills_hub`, so the patched source
-can read `SKILLHUB_URL` and `SKILLHUB_TOKEN` directly from the process
-environment.
+Install from a fork or branch:
 
-## Patched Behavior
-
-`create_source_router()` is restricted to:
-
-```text
-official, clawhub
+```bash
+curl -fsSL https://raw.githubusercontent.com/arxeme/hermes-skillhub-patch/main/install.sh | bash -s -- --repo OWNER/REPO --ref BRANCH --hermes-root /path/to/hermes-agent --check
 ```
 
-The disabled adapters are:
+Restore from backup:
 
-```text
-url, github, hermes-index, skills-sh, well-known, claude-marketplace, lobehub
+```bash
+./install.sh --hermes-root /path/to/hermes-agent --restore
 ```
 
-`ClawHubSource` remains named `clawhub` for CLI compatibility, but:
-
-- search/inspect uses `GET /api/event/skill/list`
-- fetch uses `GET /api/v1/skills/{slug}` and `GET /api/v1/download`
-- `SKILLHUB_TOKEN` is sent as `Authorization: Bearer <token>`
-- `SKILLHUB_URL` defaults to `https://skillhub.ingarena.net`
-
-## Verification
+## Verify
 
 After patching:
 
@@ -81,37 +131,28 @@ print([source.source_id() for source in create_source_router()])
 PY
 ```
 
-Expected:
+Expected output:
 
 ```text
 https://skillhub.ingarena.net/api/v1
-['official', 'clawhub']
+['clawhub']
 ```
 
-Then validate against the live service:
+Then validate against the live SkillHub service:
 
 ```bash
-hermes skills search gog
-hermes skills install gog
+hermes skills search <skill-name>
+hermes skills install <skill-name>
 ```
 
-## Evaluation
+## Operational Notes
 
-Compared with `hermes-skillhub-garena`, this approach is simpler at runtime:
-there is no wrapper, no `PYTHONPATH`, and no import hook. Hermes imports its own
-patched `tools/skills_hub.py` normally.
+This is a source patch. It does not use `sitecustomize.py`, `PYTHONPATH`, or a
+Hermes wrapper. Hermes imports its own patched `tools/skills_hub.py` normally.
 
-The tradeoff is update durability. A Hermes update may replace
-`tools/skills_hub.py`, so this patch should be re-applied after every Hermes
-upgrade. The installer keeps the change repeatable and fails closed if the
-upstream file shape no longer matches the expected source.
+Because the Hermes source file is modified in place, a Hermes upgrade may
+replace `tools/skills_hub.py`. Re-run this installer after upgrading Hermes.
 
-Operationally, this is acceptable for controlled VM releases where the Hermes
-install tree is managed by deployment scripts. It is worse than the
-`sitecustomize.py` approach for ad-hoc user machines because source updates can
-erase the patch.
-
-Security posture improves relative to the default Hermes router because public
-hub adapters plus direct URL/GitHub install routes are removed from the active
-route. After patching, company SkillHub is the only remote registry path left in
-the router.
+Use this patch when you want a controlled Hermes installation where skill
+acquisition is limited to the approved SkillHub path while preserving
+`clawhub` source compatibility.
