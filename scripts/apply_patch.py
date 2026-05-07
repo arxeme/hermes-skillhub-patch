@@ -11,6 +11,7 @@ from pathlib import Path
 
 
 HELPER_MARKER = "# BEGIN Garena SkillHub patch"
+CLAUDE_MARKETPLACE_MARKER = "\n\n\n# ---------------------------------------------------------------------------\n# Claude Code marketplace source adapter"
 
 HELPERS = r'''
 # BEGIN Garena SkillHub patch
@@ -20,9 +21,8 @@ DEFAULT_GARENA_SKILLHUB_URL = "https://skillhub.ingarena.net"
 def _garena_skillhub_root_url() -> str:
     raw = os.environ.get("SKILLHUB_URL") or DEFAULT_GARENA_SKILLHUB_URL
     base = raw.strip().rstrip("/") or DEFAULT_GARENA_SKILLHUB_URL
-    for suffix in ("/api/v1", "/api/event/skill"):
-        if base.endswith(suffix):
-            return base[: -len(suffix)]
+    if base.endswith("/api/v1"):
+        return base[: -len("/api/v1")]
     return base
 
 
@@ -30,174 +30,74 @@ def _garena_skillhub_api_base_url() -> str:
     return f"{_garena_skillhub_root_url()}/api/v1"
 
 
-def _garena_skillhub_event_base_url() -> str:
-    return f"{_garena_skillhub_root_url()}/api/event/skill"
-
-
 def _garena_skillhub_auth_headers() -> Dict[str, str]:
     token = (os.environ.get("SKILLHUB_TOKEN") or "").strip()
     return {"Authorization": f"Bearer {token}"} if token else {}
-
-
-def _garena_skillhub_event_get_json(
-    path: str,
-    params: Optional[Dict[str, Any]] = None,
-    timeout: int = 30,
-) -> Optional[Any]:
-    try:
-        resp = httpx.get(
-            f"{_garena_skillhub_event_base_url()}/{path.lstrip('/')}",
-            params=params or {},
-            headers=_garena_skillhub_auth_headers(),
-            timeout=timeout,
-            follow_redirects=True,
-        )
-        if resp.status_code != 200:
-            return None
-        payload = resp.json()
-    except (httpx.HTTPError, json.JSONDecodeError):
-        return None
-
-    if not isinstance(payload, dict):
-        return payload
-    if payload.get("code") == 200 and payload.get("status") == "success":
-        return payload.get("data")
-    return None
-
-
-def _garena_skillhub_list_skills(query: str = "", limit: int = 10) -> List[Dict[str, Any]]:
-    params: Dict[str, Any] = {"page": 1, "size": max(limit, 1)}
-    if query:
-        params["keyword"] = query
-    data = _garena_skillhub_event_get_json("list", params=params)
-    if not isinstance(data, dict):
-        return []
-    skills = data.get("skills", [])
-    return skills if isinstance(skills, list) else []
-
-
-def _garena_skillhub_item_to_meta(item: Dict[str, Any]) -> Optional[Any]:
-    slug = item.get("slug")
-    if not isinstance(slug, str) or not slug:
-        return None
-    tags = item.get("tags", [])
-    if not isinstance(tags, list):
-        tags = []
-    return SkillMeta(
-        name=item.get("name") or item.get("displayName") or slug,
-        description=item.get("description") or item.get("summary") or "",
-        source="clawhub",
-        identifier=slug,
-        trust_level="community",
-        tags=[str(tag) for tag in tags],
-    )
-
-
-def _garena_skillhub_find_skill(slug: str) -> Optional[Dict[str, Any]]:
-    for item in _garena_skillhub_list_skills(slug, limit=20):
-        if isinstance(item, dict) and item.get("slug") == slug:
-            return item
-    return None
-
-
-def _garena_skillhub_event_download_zip(slug: str, skill_id: Any) -> Dict[str, str]:
-    import io
-    import zipfile
-
-    files: Dict[str, str] = {}
-    try:
-        resp = httpx.get(
-            f"{_garena_skillhub_event_base_url()}/download",
-            params={"id": skill_id},
-            headers=_garena_skillhub_auth_headers(),
-            timeout=30,
-            follow_redirects=True,
-        )
-        if resp.status_code != 200:
-            logger.debug("Garena SkillHub event API ZIP download for %s returned %s", slug, resp.status_code)
-            return files
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            for info in zf.infolist():
-                if info.is_dir():
-                    continue
-                try:
-                    name = _validate_bundle_rel_path(info.filename)
-                except ValueError:
-                    logger.debug("Skipping unsafe ZIP member path: %s", info.filename)
-                    continue
-                if info.file_size > 500_000:
-                    logger.debug("Skipping large file in ZIP: %s (%d bytes)", name, info.file_size)
-                    continue
-                try:
-                    files[name] = zf.read(info.filename).decode("utf-8")
-                except (UnicodeDecodeError, KeyError):
-                    logger.debug("Skipping non-text file in ZIP: %s", name)
-    except zipfile.BadZipFile:
-        logger.warning("Garena SkillHub returned invalid ZIP (event API) for %s", slug)
-    except httpx.HTTPError as exc:
-        logger.debug("Garena SkillHub event API ZIP download failed for %s: %s", slug, exc)
-    return files
 # END Garena SkillHub patch
 '''
 
-CLASS_HEADER = '''class ClawHubSource(SkillSource):
-    """
-    Fetch skills from Garena SkillHub through the existing ClawHub source id.
+GARENA_SOURCE = r'''
 
-    The source id stays "clawhub" so existing CLI flags and lock-file
-    provenance keep working while the backend is company-owned.
+class GarenaSkillHubSource(SkillSource):
+    """
+    Fetch skills from Garena SkillHub using ClawHub's public v1 API contract.
+
+    Hermes exposes this source as "garena-skillhub" while all traffic goes to
+    the configured Garena SkillHub endpoint.
     """
 
     BASE_URL = _garena_skillhub_api_base_url()
-'''
 
-SEARCH_METHOD = '''    def search(self, query: str, limit: int = 10) -> List[SkillMeta]:
+    def source_id(self) -> str:
+        return "garena-skillhub"
+
+    def trust_level_for(self, identifier: str) -> str:
+        return "community"
+
+    def search(self, query: str, limit: int = 10) -> List[SkillMeta]:
         query = query.strip()
-        skills = _garena_skillhub_list_skills(query, limit=max(limit, 10))
-        results: List[SkillMeta] = []
-        for item in skills:
-            if not isinstance(item, dict):
-                continue
-            meta = _garena_skillhub_item_to_meta(item)
-            if meta is not None:
-                results.append(meta)
-        return self._finalize_search_results(query, results, limit)
-'''
+        if not query:
+            return self._list_skills(limit=limit)
 
-FETCH_METHOD = '''    def fetch(self, identifier: str) -> Optional[SkillBundle]:
-        slug = identifier.split("/")[-1]
+        results = self._search_api(query, limit=limit)
+        exact = self.inspect(query)
+        if exact:
+            results = [exact] + results
+        return self._dedupe_results(results)[:limit]
 
-        skill_data = self._get_json(f"{self.BASE_URL}/skills/{slug}")
-        if not isinstance(skill_data, dict):
+    def inspect(self, identifier: str) -> Optional[SkillMeta]:
+        slug = self._identifier_to_slug(identifier)
+        data = self._skill_detail(slug)
+        skill = data.get("skill") if isinstance(data, dict) else None
+        if not isinstance(skill, dict):
+            return None
+        return self._skill_to_meta(skill, data.get("latestVersion"))
+
+    def fetch(self, identifier: str) -> Optional[SkillBundle]:
+        slug = self._identifier_to_slug(identifier)
+        data = self._skill_detail(slug)
+        if not isinstance(data, dict):
             return None
 
-        latest_version = self._resolve_latest_version(slug, skill_data)
+        skill = data.get("skill")
+        if not isinstance(skill, dict):
+            return None
+
+        latest_version = self._resolve_latest_version(data)
         if not latest_version:
             logger.warning("Garena SkillHub fetch failed for %s: could not resolve latest version", slug)
             return None
 
         files = self._download_zip(slug, latest_version)
 
-        # Fallback: event API download via /api/event/skill/download when v1 download fails
         if "SKILL.md" not in files:
-            item = _garena_skillhub_find_skill(slug)
-            if item is not None:
-                skill_id = item.get("id")
-                if skill_id is not None:
-                    files = _garena_skillhub_event_download_zip(slug, skill_id)
-
-        if "SKILL.md" not in files:
-            version_data = self._get_json(f"{self.BASE_URL}/skills/{slug}/versions/{latest_version}")
-            if isinstance(version_data, dict):
-                files = self._extract_files(version_data) or files
-                if "SKILL.md" not in files:
-                    nested = version_data.get("version", {})
-                    if isinstance(nested, dict):
-                        files = self._extract_files(nested) or files
+            version_files = self._fetch_version_files(slug, latest_version)
+            if version_files:
+                files = version_files
 
         if "SKILL.md" not in files:
             logger.warning(
-                "Garena SkillHub fetch for %s resolved version %s but could not retrieve file content",
+                "Garena SkillHub fetch for %s resolved version %s but could not retrieve SKILL.md",
                 slug,
                 latest_version,
             )
@@ -206,94 +106,279 @@ FETCH_METHOD = '''    def fetch(self, identifier: str) -> Optional[SkillBundle]:
         return SkillBundle(
             name=slug,
             files=files,
-            source="clawhub",
+            source=self.source_id(),
             identifier=slug,
             trust_level="community",
+            metadata={
+                "displayName": skill.get("displayName"),
+                "registry": _garena_skillhub_root_url(),
+            },
         )
-'''
 
-INSPECT_METHOD = '''    def inspect(self, identifier: str) -> Optional[SkillMeta]:
-        slug = identifier.split("/")[-1]
-        item = _garena_skillhub_find_skill(slug)
-        if item is None:
-            return None
-        return _garena_skillhub_item_to_meta(item)
-'''
+    @staticmethod
+    def _identifier_to_slug(identifier: str) -> str:
+        return identifier.strip().split("/")[-1]
 
-GET_JSON_METHOD = '''    def _get_json(self, url: str, timeout: int = 20) -> Optional[Any]:
+    @staticmethod
+    def _normalize_tags(tags: Any) -> List[str]:
+        if isinstance(tags, list):
+            return [str(t) for t in tags]
+        if isinstance(tags, dict):
+            return [str(k) for k in tags if str(k) != "latest"]
+        return []
+
+    @staticmethod
+    def _latest_version_value(latest_version: Any) -> Optional[str]:
+        if isinstance(latest_version, dict):
+            version = latest_version.get("version")
+            return version if isinstance(version, str) and version else None
+        return latest_version if isinstance(latest_version, str) and latest_version else None
+
+    @classmethod
+    def _skill_to_meta(cls, skill: Dict[str, Any], latest_version: Any = None) -> SkillMeta:
+        slug = skill.get("slug")
+        if not isinstance(slug, str) or not slug:
+            slug = skill.get("name") if isinstance(skill.get("name"), str) else "unknown"
+        display_name = skill.get("displayName") or skill.get("name") or slug
+        summary = skill.get("summary") or skill.get("description") or ""
+        extra: Dict[str, Any] = {"displayName": display_name}
+        version = cls._latest_version_value(latest_version)
+        if version:
+            extra["version"] = version
+
+        # Hermes short-name install exact-matches SkillMeta.name. ClawHub CLI
+        # installs by slug, so expose the slug as the Hermes installable name.
+        return SkillMeta(
+            name=slug,
+            description=summary,
+            source="garena-skillhub",
+            identifier=slug,
+            trust_level="community",
+            tags=cls._normalize_tags(skill.get("tags", [])),
+            extra=extra,
+        )
+
+    @staticmethod
+    def _dedupe_results(results: List[SkillMeta]) -> List[SkillMeta]:
+        seen: set[str] = set()
+        deduped: List[SkillMeta] = []
+        for result in results:
+            key = (result.identifier or result.name).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(result)
+        return deduped
+
+    def _get_json(
+        self,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: int = 20,
+    ) -> Optional[Any]:
         try:
             resp = httpx.get(
-                url,
+                f"{self.BASE_URL}/{path.lstrip('/')}",
+                params=params or {},
                 headers=_garena_skillhub_auth_headers(),
                 timeout=timeout,
                 follow_redirects=True,
             )
             if resp.status_code != 200:
+                logger.debug("Garena SkillHub GET %s returned %s", path, resp.status_code)
                 return None
             return resp.json()
-        except (httpx.HTTPError, json.JSONDecodeError):
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            logger.debug("Garena SkillHub GET %s failed: %s", path, exc)
             return None
-'''
 
-DOWNLOAD_ZIP_METHOD = '''    def _download_zip(self, slug: str, version: str) -> Dict[str, str]:
-        """Download skill as a ZIP bundle from Garena SkillHub and extract text files."""
+    def _search_api(self, query: str, limit: int) -> List[SkillMeta]:
+        data = self._get_json("search", params={"q": query, "limit": max(limit, 1)}, timeout=20)
+        results = data.get("results", []) if isinstance(data, dict) else []
+        if not isinstance(results, list):
+            return []
+
+        metas: List[SkillMeta] = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            slug = item.get("slug")
+            if not isinstance(slug, str) or not slug:
+                continue
+            metas.append(self._skill_to_meta(
+                {
+                    "slug": slug,
+                    "displayName": item.get("displayName"),
+                    "summary": item.get("summary"),
+                    "tags": item.get("tags", []),
+                },
+                item.get("version"),
+            ))
+        return metas
+
+    def _list_skills(self, limit: int = 10) -> List[SkillMeta]:
+        data = self._get_json(
+            "skills",
+            params={"limit": max(limit, 1), "sort": "updated"},
+            timeout=20,
+        )
+        items = data.get("items", []) if isinstance(data, dict) else []
+        if not isinstance(items, list):
+            return []
+
+        metas: List[SkillMeta] = []
+        for item in items[:limit]:
+            if isinstance(item, dict):
+                metas.append(self._skill_to_meta(item, item.get("latestVersion")))
+        return metas
+
+    def _skill_detail(self, slug: str) -> Dict[str, Any]:
+        data = self._get_json(f"skills/{slug}", timeout=20)
+        return data if isinstance(data, dict) else {}
+
+    def _resolve_latest_version(self, skill_data: Dict[str, Any]) -> Optional[str]:
+        latest = self._latest_version_value(skill_data.get("latestVersion"))
+        if latest:
+            return latest
+        skill = skill_data.get("skill")
+        if isinstance(skill, dict):
+            tags = skill.get("tags")
+            if isinstance(tags, dict):
+                latest_tag = tags.get("latest")
+                if isinstance(latest_tag, str) and latest_tag:
+                    return latest_tag
+        return None
+
+    def _download_zip(self, slug: str, version: str) -> Dict[str, str]:
         import io
         import zipfile
 
         files: Dict[str, str] = {}
-        try:
-            resp = httpx.get(
-                f"{self.BASE_URL}/download",
-                params={"slug": slug, "version": version},
-                headers=_garena_skillhub_auth_headers(),
-                timeout=30,
-                follow_redirects=True,
-            )
-            if resp.status_code != 200:
-                logger.debug("Garena SkillHub ZIP download for %s v%s returned %s", slug, version, resp.status_code)
+        for attempt in range(3):
+            try:
+                resp = httpx.get(
+                    f"{self.BASE_URL}/download",
+                    params={"slug": slug, "version": version},
+                    headers=_garena_skillhub_auth_headers(),
+                    timeout=30,
+                    follow_redirects=True,
+                )
+                if resp.status_code == 429:
+                    retry_after = self._retry_after_seconds(resp)
+                    logger.debug(
+                        "Garena SkillHub download rate-limited for %s, retrying in %ds (attempt %d/3)",
+                        slug,
+                        retry_after,
+                        attempt + 1,
+                    )
+                    time.sleep(retry_after)
+                    continue
+                if resp.status_code != 200:
+                    logger.debug(
+                        "Garena SkillHub ZIP download for %s v%s returned %s",
+                        slug,
+                        version,
+                        resp.status_code,
+                    )
+                    return files
+                with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        try:
+                            name = _validate_bundle_rel_path(info.filename)
+                        except ValueError:
+                            logger.debug("Skipping unsafe ZIP member path: %s", info.filename)
+                            continue
+                        if info.file_size > 500_000:
+                            logger.debug("Skipping large file in ZIP: %s (%d bytes)", name, info.file_size)
+                            continue
+                        try:
+                            files[name] = zf.read(info.filename).decode("utf-8")
+                        except (UnicodeDecodeError, KeyError):
+                            logger.debug("Skipping non-text file in ZIP: %s", name)
+                    return self._normalize_bundle_files(files)
+            except zipfile.BadZipFile:
+                logger.warning("Garena SkillHub returned invalid ZIP for %s v%s", slug, version)
                 return files
+            except httpx.HTTPError as exc:
+                logger.debug("Garena SkillHub ZIP download failed for %s v%s: %s", slug, version, exc)
+                return files
+        return files
 
-            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-                for info in zf.infolist():
-                    if info.is_dir():
-                        continue
-                    try:
-                        name = _validate_bundle_rel_path(info.filename)
-                    except ValueError:
-                        logger.debug("Skipping unsafe ZIP member path: %s", info.filename)
-                        continue
-                    if info.file_size > 500_000:
-                        logger.debug("Skipping large file in ZIP: %s (%d bytes)", name, info.file_size)
-                        continue
-                    try:
-                        raw = zf.read(info.filename)
-                        files[name] = raw.decode("utf-8")
-                    except (UnicodeDecodeError, KeyError):
-                        logger.debug("Skipping non-text file in ZIP: %s", name)
-                        continue
+    @staticmethod
+    def _retry_after_seconds(resp: httpx.Response) -> int:
+        try:
+            return min(max(int(resp.headers.get("retry-after", "5")), 0), 15)
+        except (TypeError, ValueError):
+            return 5
 
+    @staticmethod
+    def _normalize_bundle_files(files: Dict[str, str]) -> Dict[str, str]:
+        if "SKILL.md" in files:
             return files
-
-        except zipfile.BadZipFile:
-            logger.warning("Garena SkillHub returned invalid ZIP for %s v%s", slug, version)
+        prefixes = {
+            path.split("/", 1)[0]
+            for path in files
+            if "/" in path and path.split("/", 1)[0]
+        }
+        if len(prefixes) != 1:
             return files
-        except httpx.HTTPError as exc:
-            logger.debug("Garena SkillHub ZIP download failed for %s v%s: %s", slug, version, exc)
-            return files
-'''
+        prefix = next(iter(prefixes)) + "/"
+        normalized = {
+            path[len(prefix):]: content
+            for path, content in files.items()
+            if path.startswith(prefix) and path[len(prefix):]
+        }
+        return normalized if "SKILL.md" in normalized else files
 
-FETCH_TEXT_METHOD = '''    def _fetch_text(self, url: str) -> Optional[str]:
+    def _fetch_version_files(self, slug: str, version: str) -> Dict[str, str]:
+        data = self._get_json(f"skills/{slug}/versions/{version}", timeout=20)
+        version_data = data.get("version") if isinstance(data, dict) else None
+        file_list = version_data.get("files") if isinstance(version_data, dict) else None
+        if not isinstance(file_list, list):
+            return {}
+
+        files: Dict[str, str] = {}
+        for file_meta in file_list:
+            if not isinstance(file_meta, dict):
+                continue
+            path = file_meta.get("path") or file_meta.get("name")
+            if not isinstance(path, str) or not path:
+                continue
+            try:
+                safe_path = _validate_bundle_rel_path(path)
+            except ValueError:
+                logger.debug("Skipping unsafe file path from version metadata: %s", path)
+                continue
+            size = file_meta.get("size")
+            if isinstance(size, int) and size > 500_000:
+                continue
+            content = self._fetch_file_text(slug, safe_path, version)
+            if content is not None:
+                files[safe_path] = content
+        return self._normalize_bundle_files(files)
+
+    def _fetch_file_text(self, slug: str, path: str, version: str) -> Optional[str]:
         try:
             resp = httpx.get(
-                url,
+                f"{self.BASE_URL}/skills/{slug}/file",
+                params={"path": path, "version": version},
                 headers=_garena_skillhub_auth_headers(),
                 timeout=20,
                 follow_redirects=True,
             )
             if resp.status_code == 200:
                 return resp.text
-        except httpx.HTTPError:
-            return None
+            logger.debug(
+                "Garena SkillHub file fetch for %s@%s %s returned %s",
+                slug,
+                version,
+                path,
+                resp.status_code,
+            )
+        except httpx.HTTPError as exc:
+            logger.debug("Garena SkillHub file fetch for %s@%s %s failed: %s", slug, version, path, exc)
         return None
 '''
 
@@ -301,12 +386,11 @@ CREATE_ROUTER = '''def create_source_router(auth: Optional[GitHubAuth] = None) -
     """
     Create company-approved source adapters for search/fetch operations.
 
-    Official optional skills, external public skill hubs, and direct URL/GitHub
-    installs are intentionally disabled. The "clawhub" source id is backed by
-    Garena SkillHub.
+    Other skill acquisition routes are intentionally disabled. The active
+    source uses Garena SkillHub's ClawHub-compatible v1 API.
     """
     sources: List[SkillSource] = [
-        ClawHubSource(),
+        GarenaSkillHubSource(),
     ]
 
     return sources
@@ -324,62 +408,19 @@ def patch_text(text: str) -> str:
     if HELPER_MARKER in text:
         raise RuntimeError("Garena SkillHub patch marker already exists; source appears patched.")
 
+    if "INDEX_CACHE_TTL = 3600  # 1 hour\n" not in text:
+        raise RuntimeError("Could not find insertion point for SkillHub helpers.")
     text = text.replace(
         "INDEX_CACHE_TTL = 3600  # 1 hour\n",
         "INDEX_CACHE_TTL = 3600  # 1 hour\n" + HELPERS,
         1,
     )
-    text = replace_regex(
-        text,
-        r'class ClawHubSource\(SkillSource\):\n    """\n    Fetch skills from ClawHub \(clawhub\.ai\).*?\n\n    BASE_URL = "https://clawhub\.ai/api/v1"\n',
-        CLASS_HEADER,
-        "ClawHubSource header",
-    )
 
-    class_start = text.find("class ClawHubSource(SkillSource):")
-    class_end_marker = "\n\n\n# ---------------------------------------------------------------------------\n# Claude Code marketplace source adapter"
-    class_end = text.find(class_end_marker, class_start)
-    if class_start == -1 or class_end == -1:
-        raise RuntimeError("Could not isolate ClawHubSource class section.")
+    marker_pos = text.find(CLAUDE_MARKETPLACE_MARKER)
+    if marker_pos == -1:
+        raise RuntimeError("Could not find insertion point for GarenaSkillHubSource.")
+    text = text[:marker_pos] + GARENA_SOURCE + text[marker_pos:]
 
-    section = text[class_start:class_end]
-    section = replace_regex(
-        section,
-        r"    def search\(self, query: str, limit: int = 10\) -> List\[SkillMeta\]:\n.*?(?=\n    def fetch\(self, identifier: str\) -> Optional\[SkillBundle\]:)",
-        SEARCH_METHOD.rstrip(),
-        "ClawHubSource.search",
-    )
-    section = replace_regex(
-        section,
-        r"    def fetch\(self, identifier: str\) -> Optional\[SkillBundle\]:\n.*?(?=\n    def inspect\(self, identifier: str\) -> Optional\[SkillMeta\]:)",
-        FETCH_METHOD.rstrip(),
-        "ClawHubSource.fetch",
-    )
-    section = replace_regex(
-        section,
-        r"    def inspect\(self, identifier: str\) -> Optional\[SkillMeta\]:\n.*?(?=\n    def _search_catalog\(self, query: str, limit: int = 10\) -> List\[SkillMeta\]:)",
-        INSPECT_METHOD.rstrip(),
-        "ClawHubSource.inspect",
-    )
-    section = replace_regex(
-        section,
-        r"    def _get_json\(self, url: str, timeout: int = 20\) -> Optional\[Any\]:\n.*?(?=\n    def _resolve_latest_version\(self, slug: str, skill_data: Dict\[str, Any\]\) -> Optional\[str\]:)",
-        GET_JSON_METHOD.rstrip(),
-        "ClawHubSource._get_json",
-    )
-    section = replace_regex(
-        section,
-        r"    def _download_zip\(self, slug: str, version: str\) -> Dict\[str, str\]:\n.*?(?=\n    def _fetch_text\(self, url: str\) -> Optional\[str\]:)",
-        DOWNLOAD_ZIP_METHOD.rstrip(),
-        "ClawHubSource._download_zip",
-    )
-    section = replace_regex(
-        section,
-        r"    def _fetch_text\(self, url: str\) -> Optional\[str\]:\n.*?$",
-        FETCH_TEXT_METHOD.rstrip(),
-        "ClawHubSource._fetch_text",
-    )
-    text = text[:class_start] + section + text[class_end:]
     text = replace_regex(
         text,
         r"def create_source_router\(auth: Optional\[GitHubAuth\] = None\) -> List\[SkillSource\]:\n.*?(?=\n\n\ndef _search_one_source)",
@@ -414,7 +455,6 @@ def main() -> int:
         return 2
 
     original = target.read_text(encoding="utf-8")
-
     if HELPER_MARKER in original:
         if args.check:
             print(f"{target} is already patched")
