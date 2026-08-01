@@ -11,7 +11,12 @@ from pathlib import Path
 
 
 HELPER_MARKER = "# BEGIN Garena SkillHub patch"
-CLAUDE_MARKETPLACE_MARKER = "\n\n\n# ---------------------------------------------------------------------------\n# Claude Code marketplace source adapter"
+# The class is inserted directly above create_source_router. Anchoring on the
+# router definition — which the patch has to locate anyway to replace it —
+# keeps the class insertion from breaking on its own when upstream reshuffles
+# the source adapters (Hermes v2026.7.30 deleted the Claude Code marketplace
+# adapter this used to anchor on).
+ROUTER_DEF_ANCHOR = "def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]:"
 
 HELPERS = r'''
 # BEGIN Garena SkillHub patch
@@ -416,10 +421,10 @@ def patch_text(text: str) -> str:
         1,
     )
 
-    marker_pos = text.find(CLAUDE_MARKETPLACE_MARKER)
-    if marker_pos == -1:
+    router_pos = text.find(ROUTER_DEF_ANCHOR)
+    if router_pos == -1:
         raise RuntimeError("Could not find insertion point for GarenaSkillHubSource.")
-    text = text[:marker_pos] + GARENA_SOURCE + text[marker_pos:]
+    text = text[:router_pos] + GARENA_SOURCE.strip("\n") + "\n\n\n" + text[router_pos:]
 
     text = replace_regex(
         text,
