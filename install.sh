@@ -16,8 +16,6 @@ PATCH_REPO="${HERMES_SKILLHUB_PATCH_REPO:-arxeme/hermes-skillhub-patch}"
 PATCH_REF="${HERMES_SKILLHUB_PATCH_REF:-main}"
 PATCH_RAW_BASE="${HERMES_SKILLHUB_PATCH_RAW_BASE:-https://raw.githubusercontent.com/${PATCH_REPO}/${PATCH_REF}}"
 CHECK_ONLY=0
-NO_BACKUP=0
-RESTORE=0
 PATCHER_PATH=""
 PATCHER_TMP=""
 
@@ -33,15 +31,13 @@ usage() {
 Usage: ./install.sh --hermes-root PATH [options]
 
 Options:
-  --hermes-root PATH   Hermes checkout/install root containing tools/skills_hub.py
+  --hermes-root PATH   Hermes checkout/install root containing tools/skills_hub_search.py
   --hermes-home PATH   Hermes runtime home (default: ~/.hermes)
   --skillhub-url URL   SkillHub base URL (default: https://skillhub.ingarena.net)
   --token TOKEN        SkillHub API token to store in <HERMES_HOME>/.env
   --repo OWNER/REPO    Patch repo for remote self-install (default: arxeme/hermes-skillhub-patch)
   --ref REF            Patch repo ref (default: main)
   --check              Validate patch applicability without modifying Hermes code
-  --no-backup          Do not create tools/skills_hub.py.bak
-  --restore            Restore tools/skills_hub.py from backup (.bak)
   -h, --help           Show this help
 EOF
 }
@@ -84,14 +80,6 @@ while [[ $# -gt 0 ]]; do
             CHECK_ONLY=1
             shift
             ;;
-        --no-backup)
-            NO_BACKUP=1
-            shift
-            ;;
-        --restore)
-            RESTORE=1
-            shift
-            ;;
         -h|--help)
             usage
             exit 0
@@ -105,7 +93,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$HERMES_ROOT" ]]; then
-    if [[ -f "tools/skills_hub.py" ]]; then
+    if [[ -f "tools/skills_hub_search.py" ]]; then
         HERMES_ROOT="$(pwd)"
     else
         echo "--hermes-root is required unless run from a Hermes root" >&2
@@ -188,17 +176,11 @@ patch_args=(--hermes-root "$HERMES_ROOT")
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
     patch_args+=(--check)
 fi
-if [[ "$NO_BACKUP" -eq 1 ]]; then
-    patch_args+=(--no-backup)
-fi
-if [[ "$RESTORE" -eq 1 ]]; then
-    patch_args+=(--restore)
-fi
 
 resolve_patcher
 "$py" "$PATCHER_PATH" "${patch_args[@]}"
 
-if [[ "$CHECK_ONLY" -eq 0 && "$RESTORE" -eq 0 ]]; then
+if [[ "$CHECK_ONLY" -eq 0 ]]; then
     HERMES_ENV_FILE="${HERMES_HOME}/.env"
     upsert_env_value "$HERMES_ENV_FILE" "SKILLHUB_URL" "$SKILLHUB_URL_VALUE"
     upsert_env_value "$HERMES_ENV_FILE" "SKILLHUB_TOKEN" "$SKILLHUB_TOKEN_VALUE"

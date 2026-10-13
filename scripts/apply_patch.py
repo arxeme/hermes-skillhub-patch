@@ -4,22 +4,31 @@
 from __future__ import annotations
 
 import argparse
-import re
-import shutil
+import ast
 import sys
 from pathlib import Path
 
 
-HELPER_MARKER = "# BEGIN Garena SkillHub patch"
-# The class is inserted directly above create_source_router. Anchoring on the
-# router definition — which the patch has to locate anyway to replace it —
-# keeps the class insertion from breaking on its own when upstream reshuffles
-# the source adapters (Hermes v2026.7.30 deleted the Claude Code marketplace
-# adapter this used to anchor on).
-ROUTER_DEF_ANCHOR = "def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]:"
+MODULE_REL = Path("tools") / "skills_hub_garena.py"
+ROUTER_REL = Path("tools") / "skills_hub_search.py"
 
-HELPERS = r'''
-# BEGIN Garena SkillHub patch
+IMPORT_ANCHOR = "from tools.skills_hub_clawhub import ClawHubSource\n"
+IMPORT_LINE = "from tools.skills_hub_garena import GarenaSkillHubSource\n"
+
+MODULE = r'''"""Skills Hub Garena SkillHub adapter (ClawHub public v1 API contract). Installed by hermes-skillhub-patch."""
+
+import json
+import logging
+import os
+import time
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+from tools.skills_hub_models import SkillBundle, SkillMeta, SkillSource, _validate_bundle_rel_path
+
+logger = logging.getLogger("tools.skills_hub")
+
 DEFAULT_GARENA_SKILLHUB_URL = "https://skillhub.ingarena.net"
 
 
@@ -38,10 +47,7 @@ def _garena_skillhub_api_base_url() -> str:
 def _garena_skillhub_auth_headers() -> Dict[str, str]:
     token = (os.environ.get("SKILLHUB_TOKEN") or "").strip()
     return {"Authorization": f"Bearer {token}"} if token else {}
-# END Garena SkillHub patch
-'''
 
-GARENA_SOURCE = r'''
 
 class GarenaSkillHubSource(SkillSource):
     """
@@ -385,113 +391,83 @@ class GarenaSkillHubSource(SkillSource):
         except httpx.HTTPError as exc:
             logger.debug("Garena SkillHub file fetch for %s@%s %s failed: %s", slug, version, path, exc)
         return None
+
+
+if __name__ == "__main__":
+    from tools.skills_hub_search import create_source_router
+
+    ids = [src.source_id() for src in create_source_router()]
+    print(ids)
+    raise SystemExit(0 if ids == [GarenaSkillHubSource().source_id()] else 1)
 '''
 
-CREATE_ROUTER = '''def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]:
+ROUTER = r'''def create_source_router(auth: Optional[GitHubAuth] = None) -> list[SkillSource]:
     """
     Create company-approved source adapters for search/fetch operations.
 
     Other skill acquisition routes are intentionally disabled. The active
     source uses Garena SkillHub's ClawHub-compatible v1 API.
     """
-    sources: List[SkillSource] = [
+    sources: list[SkillSource] = [
         GarenaSkillHubSource(),
     ]
 
-    return sources
-'''
+    return sources'''
 
 
-def replace_regex(text: str, pattern: str, replacement: str, label: str) -> str:
-    new_text, count = re.subn(pattern, replacement, text, count=1, flags=re.DOTALL)
-    if count != 1:
-        raise RuntimeError(f"Could not patch {label}; Hermes source may have changed.")
-    return new_text
+class PatchError(RuntimeError):
+    pass
 
 
-def patch_text(text: str) -> str:
-    if HELPER_MARKER in text:
-        raise RuntimeError("Garena SkillHub patch marker already exists; source appears patched.")
-
-    if "INDEX_CACHE_TTL = 3600  # 1 hour\n" not in text:
-        raise RuntimeError("Could not find insertion point for SkillHub helpers.")
-    text = text.replace(
-        "INDEX_CACHE_TTL = 3600  # 1 hour\n",
-        "INDEX_CACHE_TTL = 3600  # 1 hour\n" + HELPERS,
-        1,
-    )
-
-    router_pos = text.find(ROUTER_DEF_ANCHOR)
-    if router_pos == -1:
-        raise RuntimeError("Could not find insertion point for GarenaSkillHubSource.")
-    text = text[:router_pos] + GARENA_SOURCE.strip("\n") + "\n\n\n" + text[router_pos:]
-
-    text = replace_regex(
-        text,
-        r"def create_source_router\(auth: Optional\[GitHubAuth\] = None\) -> List\[SkillSource\]:\n.*?(?=\n\n\ndef _search_one_source)",
-        CREATE_ROUTER.rstrip(),
-        "create_source_router",
-    )
-    return text
+def patch_router_text(text: str) -> str:
+    if text.count(IMPORT_ANCHOR) != 1:
+        raise PatchError(f"expected exactly one {IMPORT_ANCHOR.strip()!r} in {ROUTER_REL}")
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as exc:
+        raise PatchError(f"{ROUTER_REL} does not parse with Python {sys.version.split()[0]} (line {exc.lineno}); run with python3 >= 3.11") from exc
+    routers = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "create_source_router"
+    ]
+    if len(routers) != 1:
+        raise PatchError(f"expected exactly one top-level create_source_router definition in {ROUTER_REL}, found {len(routers)}")
+    router = routers[0]
+    start = min([router.lineno, *(decorator.lineno for decorator in router.decorator_list)]) - 1
+    lines = text.splitlines(keepends=True)
+    text = "".join(lines[:start]) + ROUTER + "\n" + "".join(lines[router.end_lineno:])
+    return text.replace(IMPORT_ANCHOR, IMPORT_ANCHOR + IMPORT_LINE)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--hermes-root", required=True, help="Hermes checkout/install root containing tools/skills_hub.py")
+    parser.add_argument("--hermes-root", required=True, help="Hermes checkout root containing tools/skills_hub_search.py")
     parser.add_argument("--check", action="store_true", help="Validate patch applicability without writing")
-    parser.add_argument("--no-backup", action="store_true", help="Do not create tools/skills_hub.py.bak")
-    parser.add_argument("--restore", action="store_true", help="Restore tools/skills_hub.py from backup (.bak)")
     args = parser.parse_args()
 
     root = Path(args.hermes_root).expanduser().resolve()
-    target = root / "tools" / "skills_hub.py"
-
-    if args.restore:
-        backup = target.with_suffix(target.suffix + ".bak")
-        if not backup.exists():
-            print(f"No backup found at {backup}", file=sys.stderr)
-            return 1
-        shutil.copy2(backup, target)
-        print(f"Restored {target} from {backup}")
-        return 0
-
-    if not target.exists():
-        print(f"tools/skills_hub.py not found under {root}", file=sys.stderr)
+    router_path, module_path = root / ROUTER_REL, root / MODULE_REL
+    if not router_path.is_file():
+        print(f"{ROUTER_REL} not found under {root}", file=sys.stderr)
         return 2
 
-    original = target.read_text(encoding="utf-8")
-    if HELPER_MARKER in original:
-        if args.check:
-            print(f"{target} is already patched")
-            return 0
-        backup = target.with_suffix(target.suffix + ".bak")
-        if not backup.exists():
-            print(
-                f"{target} is already patched and no backup (.bak) exists.\n"
-                f"Restore the original manually, then re-run the installer.",
-                file=sys.stderr,
-            )
-            return 1
-        print(f"{target} is already patched; restoring from backup and re-applying...")
-        shutil.copy2(backup, target)
-        original = target.read_text(encoding="utf-8")
-
+    original = router_path.read_text(encoding="utf-8")
+    patched_already = IMPORT_LINE in original
     try:
-        patched = patch_text(original)
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
+        router_text = original if patched_already else patch_router_text(original)
+    except PatchError as exc:
+        print(f"Cannot apply the Garena SkillHub patch: {exc}", file=sys.stderr)
         return 1
 
     if args.check:
-        print(f"Patch can be applied to {target}")
+        state = "is already patched" if patched_already else "can be patched"
+        print(f"{root} {state}")
         return 0
 
-    if not args.no_backup:
-        backup = target.with_suffix(target.suffix + ".bak")
-        if not backup.exists():
-            shutil.copy2(target, backup)
-    target.write_text(patched, encoding="utf-8")
-    print(f"Patched {target}")
+    module_path.write_text(MODULE, encoding="utf-8")
+    if not patched_already:
+        router_path.write_text(router_text, encoding="utf-8")
+    print(f"{'Refreshed' if patched_already else 'Patched'} {router_path.parent}: {ROUTER_REL.name}, {MODULE_REL.name}")
     return 0
 
 
